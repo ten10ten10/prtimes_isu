@@ -128,34 +128,87 @@ $container->set('helper', function ($c) {
         }
 
         public function make_posts(array $results, $options = []) {
+            if (empty($results)) {
+                return [];
+            }
             $options += ['all_comments' => false];
             $all_comments = $options['all_comments'];
+            
+            $post_ids = array_column($results, 'id');
+            $post_ids_plch = implode(',', array_fill(0, count($post_ids), '?'));
+            
+            $stmt = $this->db()->prepare(
+                "SELECT post_id, COUNT(*) as count FROM comments WHERE post_id IN ($post_ids_plch) GROUP BY post_id"
+            );
+            $stmt->execute($post_ids);
+            $comment_counts = [];
+            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $comment_counts[$row['post_id']] = $row['count'];
+            }
+            
+            $stmt = $this->db()->prepare(
+                "SELECT * FROM comments 
+                WHERE post_id IN ($post_ids_plch) 
+                ORDER BY created_at DESC"
+            );
+            $stmt->execute($post_ids);
+            
+            $comments_by_post = [];
+            $comment_user_ids = [];
+            
+            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $comment) {
+                $p_id = $comment['post_id'];
+                
+                if (!$all_comments) {
+                    if (!isset($comments_by_post[$p_id])) {
+                        $comments_by_post[$p_id] = [];
+                    }
+                    if (count($comments_by_post[$p_id]) >= 3) {
+                        continue;
+                    }
+                }
+                
+                $comments_by_post[$p_id][] = $comment;
+                $comment_user_ids[] = $comment['user_id'];
+            }
+            
+            $post_user_ids = array_column($results, 'user_id');
+            $all_user_ids = array_unique(array_merge($post_user_ids, $comment_user_ids));
+            
+            $users = [];
+            if (!empty($all_user_ids)) {
+                $u_ids_plch = implode(',', array_fill(0, count($all_user_ids), '?'));
+                $stmt = $this->db()->prepare("SELECT * FROM users WHERE id IN ($u_ids_plch)");
+                $stmt->execute(array_values($all_user_ids));
+                foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $user) {
+                    $users[$user['id']] = $user;
+                }
+            }
 
             $posts = [];
             foreach ($results as $post) {
-                $post['comment_count'] = $this->fetch_first('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', $post['id'])['count'];
-                $query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC';
-                if (!$all_comments) {
-                    $query .= ' LIMIT 3';
+                $post['comment_count'] = $comment_counts[$post['id']] ?? 0;
+                
+                $raw_comments = $comments_by_post[$post['id']] ?? [];
+                
+                foreach ($raw_comments as &$c) {
+                    $c['user'] = $users[$c['user_id']] ?? null;
                 }
-
-                $ps = $this->db()->prepare($query);
-                $ps->execute([$post['id']]);
-                $comments = $ps->fetchAll(PDO::FETCH_ASSOC);
-                foreach ($comments as &$comment) {
-                    $comment['user'] = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $comment['user_id']);
-                }
-                unset($comment);
-                $post['comments'] = array_reverse($comments);
-
-                $post['user'] = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $post['user_id']);
-                if ($post['user']['del_flg'] == 0) {
+                unset($c);
+                
+                $post['comments'] = array_reverse($raw_comments); 
+                
+                $post['user'] = $users[$post['user_id']] ?? null;
+                
+                if ($post['user'] && $post['user']['del_flg'] == 0) {
                     $posts[] = $post;
                 }
+                
                 if (count($posts) >= POSTS_PER_PAGE) {
                     break;
                 }
             }
+            
             return $posts;
         }
 
